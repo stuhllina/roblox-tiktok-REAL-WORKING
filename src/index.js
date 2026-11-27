@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
+
 import {
     TikTokLiveConnection,
     WebcastEvent,
@@ -11,52 +12,58 @@ import * as events from './events.js';
 import { extractUsername, giftTier } from './parse.js';
 import { resolveRobloxName } from './roblox.js';
 
-// TikTok viewer -> registered Roblox username
+// ───────── STATE ─────────
+
 const links = new Map();
 
 const status = {
-    tiktok: config.tiktokUsername ? 'connecting' : 'disabled',
+    tiktok: 'connecting',
     since: Date.now(),
     lastError: null
 };
 
-const DEBUG = (process.env.DEBUG_CHAT ?? 'true').trim() === 'true';
+let websocketFrames = 0;
+let decodedMessages = 0;
+let chatMessages = 0;
+let giftMessages = 0;
 
 // ───────── COMMENT HANDLER ─────────
 
 async function handleComment(tiktokId, nickname, comment) {
-    console.log(`[chat] Received from @${tiktokId}: ${JSON.stringify(comment)}`);
+    console.log(
+        `[chat] @${tiktokId} commented: ${JSON.stringify(comment)}`
+    );
 
     const raw = extractUsername(comment);
 
     if (!raw) {
-        console.log('[chat] Ignored: comment did not match username format');
+        console.log('[chat] Ignored: invalid username format');
         return { ok: false, reason: 'not a username' };
     }
 
-    const prev = links.get(tiktokId);
+    const previous = links.get(tiktokId);
 
-    if (prev && prev.roblox.toLowerCase() === raw.toLowerCase()) {
-        console.log(`[chat] Already linked to ${raw}`);
+    if (
+        previous &&
+        previous.roblox.toLowerCase() === raw.toLowerCase()
+    ) {
         return { ok: false, reason: 'already linked' };
     }
 
-    if (prev && Date.now() - prev.at < config.joinCooldownMs) {
-        const wait = Math.ceil(
-            (config.joinCooldownMs - (Date.now() - prev.at)) / 1000
-        );
-
-        console.log(`[chat] Cooldown: ${wait}s remaining`);
+    if (
+        previous &&
+        Date.now() - previous.at < config.joinCooldownMs
+    ) {
         return { ok: false, reason: 'cooldown' };
     }
 
-    console.log(`[chat] Checking Roblox username: ${raw}`);
+    console.log(`[chat] Validating Roblox username: ${raw}`);
 
     const user = await resolveRobloxName(raw);
 
     if (!user) {
-        console.log(`[chat] Roblox username not found: ${raw}`);
-        return { ok: false, reason: 'no such Roblox user' };
+        console.log(`[chat] Roblox user not found: ${raw}`);
+        return { ok: false, reason: 'Roblox user not found' };
     }
 
     links.set(tiktokId, {
@@ -71,16 +78,26 @@ async function handleComment(tiktokId, nickname, comment) {
         nickname
     });
 
-    console.log(`[join] SUCCESS: @${tiktokId} -> ${user.name}`);
+    console.log(
+        `[join] SUCCESS: @${tiktokId} -> ${user.name}`
+    );
 
     return { ok: true, event: ev };
 }
 
 // ───────── GIFT HANDLER ─────────
 
-function handleGift(tiktokId, nickname, giftName, diamondsEach, count) {
-    const diamonds = Math.max(1, diamondsEach) * Math.max(1, count);
-    const tier = giftTier(diamonds);
+function handleGift(
+    tiktokId,
+    nickname,
+    giftName,
+    diamondsEach,
+    count
+) {
+    const totalDiamonds =
+        Math.max(1, Number(diamondsEach) || 1) *
+        Math.max(1, Number(count) || 1);
+
     const link = links.get(tiktokId);
 
     const ev = events.push('gift', {
@@ -89,13 +106,14 @@ function handleGift(tiktokId, nickname, giftName, diamondsEach, count) {
         nickname,
         giftName,
         count,
-        diamonds,
-        tier
+        diamonds: totalDiamonds,
+        tier: giftTier(totalDiamonds)
     });
 
     console.log(
         `[gift] @${tiktokId}: ${giftName} x${count} ` +
-        `(${diamonds} diamonds) -> ${link?.roblox ?? 'unlinked'}`
+        `(${totalDiamonds} diamonds) -> ` +
+        `${link?.roblox ?? 'unlinked'}`
     );
 
     return ev;
@@ -105,32 +123,30 @@ function handleGift(tiktokId, nickname, giftName, diamondsEach, count) {
 
 function startTikTok() {
     if (!config.tiktokUsername) {
-        console.log('[tiktok] TIKTOK_USERNAME missing - test-only mode');
+        console.log('[tiktok] Missing TIKTOK_USERNAME');
+        status.tiktok = 'disabled';
         return;
     }
 
-    const conn = new TikTokLiveConnection(config.tiktokUsername, {
-        ...(config.eulerKey ? { signApiKey: config.eulerKey } : {}),
-        enableExtendedGiftInfo: false,
-        processInitialData: false
-    });
+    const conn = new TikTokLiveConnection(
+        config.tiktokUsername,
+        {
+            processInitialData: false,
+            enableExtendedGiftInfo: true
+        }
+    );
 
     let retryTimer = null;
 
-    let websocketFrames = 0;
-    let decodedMessages = 0;
-    let chatMessages = 0;
-    let giftMessages = 0;
-
-    const retry = (delay) => {
+    function retry(delay) {
         clearTimeout(retryTimer);
         retryTimer = setTimeout(connect, delay);
-    };
+    }
 
     async function connect() {
-        status.tiktok = 'connecting';
-
         try {
+            status.tiktok = 'connecting';
+
             const state = await conn.connect();
 
             status.tiktok = 'connected';
@@ -143,119 +159,172 @@ function startTikTok() {
 
             console.log(`[tiktok] Room ID: ${state.roomId}`);
 
-            const info = conn.roomInfo ?? state;
-
-            const viewers =
-                info?.viewer_count ??
-                info?.viewerCount ??
-                info?.stats?.viewer_count ??
-                info?.stats?.viewerCount ??
-                'unknown';
-
-            console.log(`[tiktok] Viewers: ${viewers}`);
-
-        } catch (err) {
+        } catch (error) {
             status.tiktok = 'offline';
-            status.lastError = err?.message ?? String(err);
+            status.lastError = error?.message ?? String(error);
 
-            console.warn('[tiktok] CONNECTION FAILED:', status.lastError);
+            console.error('[tiktok] CONNECTION ERROR:', error);
 
             retry(15000);
         }
     }
 
-    // WebSocket connection established
+    // WebSocket connection
     conn.on(ControlEvent.WEBSOCKET_CONNECTED, () => {
         console.log('[tiktok] WEBSOCKET CONNECTED');
     });
 
-    // Actual incoming WebSocket frames
+    // Incoming WebSocket data
     conn.on(ControlEvent.WEBSOCKET_DATA, (data) => {
         websocketFrames++;
 
         console.log(
-            `[tiktok] WEBSOCKET FRAME #${websocketFrames}: ` +
-            `${data?.byteLength ?? data?.length ?? 0} bytes`
+            `[diagnostic] WebSocket frame #${websocketFrames}`
         );
     });
 
-    // Successfully decoded messages
-    conn.on(ControlEvent.DECODED_DATA, (method, decoded) => {
+    // Decoded TikTok messages
+    conn.on(ControlEvent.DECODED_DATA, (method, data) => {
         decodedMessages++;
 
-        console.log(`[tiktok] DECODED MESSAGE: ${method}`);
-
-        if (method === 'WebcastChatMessage') {
-            console.log('[tiktok] CHAT MESSAGE DECODED');
-        }
+        console.log(
+            `[diagnostic] Decoded message: ${method}`
+        );
     });
 
-    // Chat comments
+    // ───────── CHAT EVENTS ─────────
+
     conn.on(WebcastEvent.CHAT, async (data) => {
         chatMessages++;
 
-        const id = data.user?.uniqueId;
-        const nickname = data.user?.nickname ?? id ?? 'unknown';
-        const comment = data.comment ?? '';
+        // Modern connector format, with legacy fallbacks.
+        const tiktokId =
+            data.user?.displayId ??
+            data.user?.uniqueId ??
+            null;
+
+        const nickname =
+            data.user?.nickname ??
+            tiktokId ??
+            'Unknown';
+
+        const comment =
+            data.content ??
+            data.comment ??
+            '';
 
         console.log(
-            `[chat] EVENT #${chatMessages}: ` +
-            `@${id ?? 'unknown'}: ${JSON.stringify(comment)}`
+            `[chat] EVENT #${chatMessages}`
         );
 
-        if (!id) {
-            console.warn('[chat] Missing TikTok user ID');
+        console.log(
+            `[chat] TikTok handle: ${tiktokId ?? 'MISSING'}`
+        );
+
+        console.log(
+            `[chat] Comment: ${JSON.stringify(comment)}`
+        );
+
+        if (!tiktokId) {
+            console.warn(
+                '[chat] Missing TikTok displayId and uniqueId'
+            );
             return;
         }
 
         try {
-            const result = await handleComment(id, nickname, comment);
+            const result = await handleComment(
+                tiktokId,
+                nickname,
+                comment
+            );
 
             console.log(
-                `[chat] RESULT for @${id}:`,
-                result.ok ? 'SUCCESS' : result.reason
+                `[chat] RESULT: ${
+                    result.ok ? 'SUCCESS' : result.reason
+                }`
             );
-        } catch (err) {
-            console.warn('[chat] PROCESSING ERROR:', err.message);
+
+        } catch (error) {
+            console.error(
+                '[chat] PROCESSING ERROR:',
+                error
+            );
         }
     });
 
-    // Gifts
+    // ───────── GIFT EVENTS ─────────
+
     conn.on(WebcastEvent.GIFT, (data) => {
         giftMessages++;
 
-        const details = data.giftDetails ?? {};
+        const tiktokId =
+            data.user?.displayId ??
+            data.user?.uniqueId;
 
-        if (details.giftType === 1 && !data.repeatEnd) {
+        if (!tiktokId) {
+            console.warn('[gift] Missing sender ID');
             return;
         }
 
-        const id = data.user?.uniqueId;
+        const gift = data.gift;
 
-        if (!id) return;
+        if (!gift) {
+            console.warn('[gift] Missing gift information');
+            return;
+        }
 
-        console.log(`[gift] EVENT #${giftMessages}`);
+        // Wait until a gift streak has finished.
+        if (gift.type === 1 && data.repeatEnd !== 1) {
+            console.log(
+                `[gift] Streak in progress: ${gift.name}`
+            );
+            return;
+        }
+
+        const nickname =
+            data.user?.nickname ??
+            tiktokId;
+
+        const giftName =
+            gift.name ??
+            `Gift ${data.giftId}`;
+
+        const diamondsEach =
+            data.extendedGiftInfo?.diamondCount ??
+            gift.diamondCount ??
+            1;
+
+        const count =
+            data.repeatCount ??
+            1;
+
+        console.log(
+            `[gift] EVENT #${giftMessages}: ${giftName}`
+        );
 
         handleGift(
-            id,
-            data.user?.nickname ?? id,
-            details.giftName ?? `gift ${data.giftId}`,
-            details.diamondCount ?? 1,
-            data.repeatCount ?? 1
+            tiktokId,
+            nickname,
+            giftName,
+            diamondsEach,
+            count
         );
     });
 
-    // Diagnostic heartbeat
-    setInterval(() => {
-        if (status.tiktok !== 'connected') return;
+    // ───────── CONNECTION EVENTS ─────────
 
-        console.log(
-            `[diagnostic] Frames: ${websocketFrames} | ` +
-            `Decoded: ${decodedMessages} | ` +
-            `Chats: ${chatMessages} | ` +
-            `Gifts: ${giftMessages}`
-        );
-    }, 15000);
+    conn.on(ControlEvent.ERROR, (error) => {
+        console.error('[tiktok] ERROR:', error);
+    });
+
+    conn.on(ControlEvent.DISCONNECTED, (data) => {
+        status.tiktok = 'offline';
+
+        console.warn('[tiktok] DISCONNECTED:', data);
+
+        retry(5000);
+    });
 
     conn.on(WebcastEvent.STREAM_END, () => {
         status.tiktok = 'offline';
@@ -265,36 +334,32 @@ function startTikTok() {
         retry(30000);
     });
 
-    conn.on(ControlEvent.DISCONNECTED, (data) => {
-        if (status.tiktok === 'connected') {
-            status.tiktok = 'offline';
-
-            console.warn('[tiktok] DISCONNECTED:', data);
-
-            retry(5000);
-        }
-    });
-
-    conn.on(ControlEvent.ERROR, (error) => {
-        console.warn('[tiktok] ERROR:', error);
-    });
+    // Diagnostics every 15 seconds
+    setInterval(() => {
+        console.log(
+            `[diagnostic] Frames: ${websocketFrames} | ` +
+            `Decoded: ${decodedMessages} | ` +
+            `Chats: ${chatMessages} | ` +
+            `Gifts: ${giftMessages}`
+        );
+    }, 15000);
 
     connect();
 }
 
-// ───────── HTTP API ─────────
+// ───────── HTTP AUTHENTICATION ─────────
 
 function authed(req) {
     const given = Buffer.from(
         String(req.headers['x-runway-secret'] ?? '')
     );
 
-    const want = Buffer.from(config.secret);
+    const expected = Buffer.from(config.secret);
 
     return (
-        given.length === want.length &&
-        want.length > 0 &&
-        timingSafeEqual(given, want)
+        given.length === expected.length &&
+        expected.length > 0 &&
+        timingSafeEqual(given, expected)
     );
 }
 
@@ -313,15 +378,17 @@ async function readJson(req) {
         body += chunk;
 
         if (body.length > 10000) {
-            throw new Error('body too large');
+            throw new Error('Request too large');
         }
     }
 
     return body ? JSON.parse(body) : {};
 }
 
+// ───────── HTTP ROUTES ─────────
+
 const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url, 'http://x');
+    const url = new URL(req.url, 'http://localhost');
 
     try {
         if (url.pathname === '/health') {
@@ -337,7 +404,10 @@ const server = http.createServer(async (req, res) => {
             });
         }
 
-        if (req.method === 'GET' && url.pathname === '/events') {
+        if (
+            req.method === 'GET' &&
+            url.pathname === '/events'
+        ) {
             const cursor =
                 Number(url.searchParams.get('since') ?? 0) || 0;
 
@@ -347,38 +417,51 @@ const server = http.createServer(async (req, res) => {
             });
         }
 
-        if (req.method === 'GET' && url.pathname === '/status') {
+        if (
+            req.method === 'GET' &&
+            url.pathname === '/status'
+        ) {
             return send(res, 200, {
                 ...status,
                 links: links.size,
                 ...events.stats(),
-                channel: config.tiktokUsername || null
+                channel: config.tiktokUsername
             });
         }
 
-        // Test comments without TikTok LIVE
-        if (req.method === 'POST' && url.pathname === '/test/comment') {
-            const b = await readJson(req);
+        // Test comment
+        if (
+            req.method === 'POST' &&
+            url.pathname === '/test/comment'
+        ) {
+            const body = await readJson(req);
 
-            const r = await handleComment(
-                b.tiktok ?? `tester_${Math.random().toString(36).slice(2, 7)}`,
-                b.tiktok ?? 'tester',
-                String(b.comment ?? '')
+            const testId =
+                body.tiktok ??
+                `tester_${Date.now()}`;
+
+            const result = await handleComment(
+                testId,
+                testId,
+                String(body.comment ?? '')
             );
 
-            return send(res, 200, r);
+            return send(res, 200, result);
         }
 
-        // Test gifts without TikTok LIVE
-        if (req.method === 'POST' && url.pathname === '/test/gift') {
-            const b = await readJson(req);
+        // Test gift
+        if (
+            req.method === 'POST' &&
+            url.pathname === '/test/gift'
+        ) {
+            const body = await readJson(req);
 
             const ev = handleGift(
-                b.tiktok ?? 'tester',
-                b.tiktok ?? 'tester',
-                b.giftName ?? 'Rose',
-                Number(b.diamonds ?? 1),
-                Number(b.count ?? 1)
+                body.tiktok ?? 'tester',
+                body.tiktok ?? 'tester',
+                body.giftName ?? 'Rose',
+                Number(body.diamonds ?? 1),
+                Number(body.count ?? 1)
             );
 
             return send(res, 200, {
@@ -391,25 +474,27 @@ const server = http.createServer(async (req, res) => {
             error: 'not found'
         });
 
-    } catch (err) {
+    } catch (error) {
+        console.error('[http] ERROR:', error);
+
         return send(res, 400, {
-            error: err.message
+            error: error.message
         });
     }
 });
 
-// ───────── START SERVER ─────────
+// ───────── START ─────────
 
 server.listen(config.port, () => {
-    console.log(`[http] Runway relay listening on :${config.port}`);
+    console.log(
+        `[http] Runway relay listening on port ${config.port}`
+    );
 
     console.log(
-        `[config] commentMode=${config.commentMode}` +
-        (config.commentMode === 'prefix'
-            ? ` prefix="${config.commentPrefix}"`
-            : '') +
-        ` validateNames=${config.validateNames}`
+        `[config] TikTok: ${config.tiktokUsername}`
     );
+
+    console.log('[runway] Relay starting...');
 
     startTikTok();
 });
